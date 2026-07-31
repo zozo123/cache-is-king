@@ -1,0 +1,7 @@
+.git
+.github
+docs
+dist
+*.html
+*.json
+cache-is-king

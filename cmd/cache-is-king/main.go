@@ -1,162 +1,114 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
-	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"os"
-	"strings"
-	"time"
-
-	"github.com/zozo123/cache-is-king/internal/bench"
 )
 
 var version = "dev"
 
-func main() {
-	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+type Finding struct {
+	Severity string `json:"severity"`
+	Title    string `json:"title"`
+	Detail   string `json:"detail"`
+	Fix      string `json:"fix"`
+	File     string `json:"file,omitempty"`
+	Line     int    `json:"line,omitempty"`
+}
+type Doctor struct {
+	Kind         string    `json:"kind"`
+	Schema       string    `json:"schema"`
+	Root         string    `json:"root"`
+	Score        int       `json:"score"`
+	Grade        string    `json:"grade"`
+	Dockerfiles  []string  `json:"dockerfiles"`
+	ContextBytes int64     `json:"context_bytes"`
+	CacheMounts  int       `json:"cache_mounts"`
+	Findings     []Finding `json:"findings"`
+}
+type Metrics struct {
+	Refaults    int64 `json:"refaults"`
+	MajorFaults int64 `json:"major_faults"`
+	ReadBytes   int64 `json:"read_bytes"`
+	MemoryPSIUS int64 `json:"memory_psi_us"`
+	IOPSIUS     int64 `json:"io_psi_us"`
+}
+type Vertex struct {
+	Name       string `json:"name"`
+	Phase      string `json:"phase"`
+	Cached     bool   `json:"cached"`
+	DurationMS int64  `json:"duration_ms"`
+}
+type Build struct {
+	Name       string   `json:"name"`
+	DurationMS int64    `json:"duration_ms"`
+	Vertices   int      `json:"vertices"`
+	Cached     int      `json:"cached_vertices"`
+	CacheRatio float64  `json:"cache_ratio"`
+	Metrics    Metrics  `json:"metrics"`
+	Slowest    []Vertex `json:"slowest"`
+}
+type Bench struct {
+	Kind        string         `json:"kind"`
+	Schema      string         `json:"schema"`
+	Context     string         `json:"context"`
+	Builder     string         `json:"builder"`
+	Output      string         `json:"output"`
+	Score       int            `json:"score"`
+	Grade       string         `json:"grade"`
+	Cold        Build          `json:"cold"`
+	Warm        Build          `json:"warm"`
+	Runs        []Build        `json:"runs"`
+	WarmSpeedup float64        `json:"warm_speedup"`
+	Findings    []Finding      `json:"findings"`
+	Environment map[string]any `json:"environment"`
+}
+type Comparison struct {
+	Kind     string    `json:"kind"`
+	Schema   string    `json:"schema"`
+	Baseline string    `json:"baseline"`
+	Winner   string    `json:"winner"`
+	Entries  []Entry   `json:"entries"`
+	Findings []Finding `json:"findings"`
+}
+type Entry struct {
+	Label       string  `json:"label"`
+	WarmMS      int64   `json:"warm_duration_ms"`
+	Delta       float64 `json:"duration_delta_pct"`
+	CacheRatio  float64 `json:"cache_ratio"`
+	Refaults    int64   `json:"refaults"`
+	ReadBytes   int64   `json:"read_bytes"`
+	MemoryPSIUS int64   `json:"memory_psi_us"`
 }
 
-func run(args []string, stdout, stderr io.Writer) int {
-	if len(args) == 0 || args[0] == "help" || args[0] == "--help" || args[0] == "-h" {
-		usage(stdout)
+func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
+func run(a []string, out, errout io.Writer) int {
+	if len(a) == 0 || a[0] == "help" || a[0] == "--help" {
+		usage(out)
 		return 0
 	}
-	if args[0] == "--version" || args[0] == "version" {
-		fmt.Fprintln(stdout, version)
+	switch a[0] {
+	case "doctor":
+		return runDoctor(a[1:], out, errout)
+	case "docker":
+		return runDocker(a[1:], out, errout)
+	case "compare":
+		return runCompare(a[1:], out, errout)
+	case "report":
+		return runReport(a[1:], out, errout)
+	case "env":
+		jsonOut(out, environment())
+		return 0
+	case "version", "--version":
+		fmt.Fprintln(out, version)
 		return 0
 	}
-	if args[0] != "bench" {
-		fmt.Fprintf(stderr, "cache-is-king: unknown command %q\n\n", args[0])
-		usage(stderr)
-		return 2
-	}
-	return runBench(args[1:], stdout, stderr)
+	fmt.Fprintf(errout, "unknown command %q\n", a[0])
+	return 2
 }
-
-func runBench(args []string, stdout, stderr io.Writer) int {
-	flags := flag.NewFlagSet("cache-is-king bench", flag.ContinueOnError)
-	flags.SetOutput(stderr)
-	pollute := flags.String("pollute", "", "shell command to run between warm measurements")
-	directory := flags.String("dir", ".", "working directory")
-	timeout := flags.Duration("timeout", 30*time.Minute, "timeout for each command")
-	asJSON := flags.Bool("json", false, "print JSON")
-	showOutput := flags.Bool("show-output", false, "stream command output")
-	flags.Usage = func() { benchUsage(stderr) }
-
-	separator := -1
-	for index, arg := range args {
-		if arg == "--" {
-			separator = index
-			break
-		}
-	}
-	if separator < 0 {
-		fmt.Fprintln(stderr, "cache-is-king bench: command must follow --")
-		benchUsage(stderr)
-		return 2
-	}
-	if err := flags.Parse(args[:separator]); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return 0
-		}
-		return 2
-	}
-	command := args[separator+1:]
-	if len(command) == 0 {
-		fmt.Fprintln(stderr, "cache-is-king bench: empty command")
-		return 2
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	report, err := bench.Execute(ctx, bench.Options{
-		Command:       command,
-		Pollute:       *pollute,
-		Directory:     *directory,
-		Timeout:       *timeout,
-		CommandOutput: *showOutput,
-	})
-	if err != nil {
-		fmt.Fprintf(stderr, "cache-is-king: %v\n", err)
-		return 1
-	}
-
-	if *asJSON {
-		encoder := json.NewEncoder(stdout)
-		encoder.SetIndent("", "  ")
-		if err := encoder.Encode(report); err != nil {
-			fmt.Fprintf(stderr, "cache-is-king: %v\n", err)
-			return 1
-		}
-		return 0
-	}
-	printReport(stdout, report)
-	return 0
-}
-
-func printReport(output io.Writer, report bench.Report) {
-	fmt.Fprintln(output, "CACHE IS KING")
-	fmt.Fprintf(output, "command: %s\n", strings.Join(report.Command, " "))
-	fmt.Fprintf(output, "cold-ish: %s\n", rounded(report.Cold.Duration))
-	fmt.Fprintf(output, "warm:     %s  (%.2fx)\n", rounded(report.Warm.Duration), report.WarmSpeedup)
-	if report.Pollution != nil && report.AfterPollution != nil {
-		fmt.Fprintf(output, "pollute:  %s\n", rounded(report.Pollution.Duration))
-		fmt.Fprintf(output, "after:    %s  (%+.0f%% vs warm)\n", rounded(report.AfterPollution.Duration), report.PollutionPenalty*100)
-	}
-	fmt.Fprintln(output)
-	for _, finding := range report.Findings {
-		fmt.Fprintf(output, "- %s\n", finding)
-	}
-	if report.Warm.Metrics.Available {
-		fmt.Fprintln(output)
-		fmt.Fprintln(output, "Linux cache signals (warm run):")
-		printMetric(output, "file refaults", metric(report.Warm, "workingset_refault_file"))
-		printMetric(output, "major faults", metric(report.Warm, "pgmajfault"))
-		printMetric(output, "memory PSI", report.Warm.Metrics.PSI["memory"])
-		printMetric(output, "I/O PSI", report.Warm.Metrics.PSI["io"])
-	}
-}
-
-func metric(run bench.Run, name string) int64 {
-	if value, ok := run.Metrics.Memory[name]; ok {
-		return value
-	}
-	return run.Metrics.VMStat[name]
-}
-
-func printMetric(output io.Writer, name string, value int64) {
-	fmt.Fprintf(output, "  %-14s %d\n", name+":", value)
-}
-
-func rounded(duration time.Duration) time.Duration {
-	if duration >= time.Second {
-		return duration.Round(10 * time.Millisecond)
-	}
-	return duration.Round(time.Millisecond)
-}
-
-func usage(output io.Writer) {
-	fmt.Fprintln(output, "Cache Is King — measure logical cache reuse and Linux page-cache heat")
-	fmt.Fprintln(output)
-	fmt.Fprintln(output, "Usage:")
-	fmt.Fprintln(output, "  cache-is-king bench [options] -- COMMAND [ARG...]")
-	fmt.Fprintln(output, "  cache-is-king version")
-	fmt.Fprintln(output)
-	fmt.Fprintln(output, "Example:")
-	fmt.Fprintln(output, "  cache-is-king bench --pollute 'find . -type f -print0 | xargs -0 cat >/dev/null' -- go test ./...")
-}
-
-func benchUsage(output io.Writer) {
-	fmt.Fprintln(output, "Usage: cache-is-king bench [options] -- COMMAND [ARG...]")
-	fmt.Fprintln(output)
-	fmt.Fprintln(output, "Options:")
-	fmt.Fprintln(output, "  --pollute CMD    run a scan/export-like command before the final warm run")
-	fmt.Fprintln(output, "  --dir PATH       working directory (default .)")
-	fmt.Fprintln(output, "  --timeout D      timeout for each command (default 30m)")
-	fmt.Fprintln(output, "  --show-output    stream command output")
-	fmt.Fprintln(output, "  --json           print machine-readable results")
+func jsonOut(w io.Writer, v any) { e := json.NewEncoder(w); e.SetIndent("", "  "); _ = e.Encode(v) }
+func usage(w io.Writer) {
+	fmt.Fprintln(w, "Cache Is King — Docker cache physics from BuildKit keys to Linux page heat\n\nCommands:\n  doctor [--json] [--html FILE] [--strict] [PATH]\n  docker [--runs N] [--output none|load] [--html FILE] [CONTEXT]\n  compare [--json] [--html FILE] LABEL=RESULT.json ...\n  report [--output FILE] RESULT.json\n  env\n  version")
 }

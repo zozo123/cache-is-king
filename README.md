@@ -1,122 +1,119 @@
 # Cache Is King
 
-**Measure the cache you think you have.**
+[![CI](https://github.com/zozo123/cache-is-king/actions/workflows/ci.yml/badge.svg)](https://github.com/zozo123/cache-is-king/actions/workflows/ci.yml)
+[![Pages](https://img.shields.io/badge/live-GitHub%20Pages-64f0a7)](https://zozo123.github.io/cache-is-king/)
 
-`cache-is-king` is a small, local-first profiler for build caches. It runs the same command cold-ish and warm, optionally inserts a large scan/export workload, then reports whether persistent cache state actually stayed fast and memory-resident.
+**Your cache hit. Your disk did not.**
 
-It connects two ideas:
+`cache-is-king` is a local-first Docker cache profiler. It connects Dockerfile and BuildKit cache reuse to the hidden layer that decides whether a hit is actually fast: Linux page-cache residency.
 
-- BuildKit and compiler caches decide whether work can be reused.
-- Linux page-cache policy decides whether that reuse is cheap or requires storage reads and refaults.
+It answers three questions:
 
-The tool works without root. On Linux it also records cgroup and kernel signals such as file-page refaults, major faults, reclaim activity, and memory/I/O PSI.
+1. Which Dockerfile or CI choice destroys reuse?
+2. Which BuildKit phase dominates cold and warm builds?
+3. Did a logical cache hit still refault pages and reread storage?
 
-## The one-liner
+No account, daemon, source upload, root, or custom kernel is required.
+
+## Start
 
 ```sh
-go run ./cmd/cache-is-king bench \
-  --pollute 'find . -type f -print0 | xargs -0 cat >/dev/null' \
-  -- go test ./...
+curl -fsSL https://zozo123.github.io/cache-is-king/run | sh -s -- doctor .
 ```
 
-Example output:
+Then benchmark Docker:
+
+```sh
+cache-is-king docker --runs 3 --json . > default.json
+cache-is-king docker --runs 3 --html cache-report.html .
+```
+
+## `doctor`
+
+```sh
+cache-is-king doctor .
+cache-is-king doctor --strict .
+cache-is-king doctor --json . > doctor.json
+```
+
+It finds high-value cache mistakes:
+
+- broad `COPY . .` before dependency installation;
+- missing `.dockerignore`;
+- compiler or package-manager steps without cache mounts;
+- secrets passed through `ARG` or `ENV`;
+- hosted GitHub builds without portable layer caches;
+- `type=gha` without `mode=max`;
+- unrelated images sharing the default GHA cache scope;
+- `load: true` plus `push: true` double handling.
+
+## `docker`
+
+```sh
+cache-is-king docker .
+cache-is-king docker --runs 5 --output load --tag app:probe .
+```
+
+The command creates an isolated `docker-container` Buildx builder, runs one cold and multiple warm builds, parses BuildKit's raw JSON progress, and records:
+
+- completed and cached vertices;
+- context, metadata, execution, cache-transfer, and export phases;
+- `workingset_refault_file` and major faults;
+- cgroup storage reads;
+- memory and I/O PSI.
+
+A **logical hit** means BuildKit can reuse a result. A **hot hit** means the bytes needed to realize it are still resident near the CPU. Cache Is King measures the gap.
+
+## Evaluate `cache_ext`
+
+[`cache_ext`](https://github.com/cache-ext/cache_ext) lets controlled Linux hosts attach custom eBPF page-cache eviction policies to cgroups. Cache Is King provides the Docker workload and stable report format for comparing those policies:
+
+```sh
+# Run the same command under each policy/environment.
+cache-is-king docker --runs 5 --json . > default.json
+cache-is-king docker --runs 5 --json . > s3fifo.json
+cache-is-king docker --runs 5 --json . > lhd.json
+
+cache-is-king compare --html policies.html \
+  default=default.json s3fifo=s3fifo.json lhd=lhd.json
+```
+
+The comparison keeps warm duration beside cache ratio, refaults, storage reads, and PSI so a policy is not credited merely for receiving warmer BuildKit state.
+
+## Commands
 
 ```text
-CACHE IS KING
-command: go test ./...
-cold-ish: 31.42s
-warm:      4.18s  (7.52x)
-pollute:   8.31s
-after:     6.02s  (+44% vs warm)
-
-- warm execution is 7.52x faster; the workload has meaningful reusable state
-- scan pollution slowed the warm command by 44%; persistent bytes are not staying memory-hot
-- warm execution still incurred 18342 cgroup file-page refaults
+cache-is-king doctor [--json] [--html FILE] [--strict] [PATH]
+cache-is-king docker [--runs N] [--output none|load] [--html FILE] [CONTEXT]
+cache-is-king compare [--json] [--html FILE] LABEL=RESULT.json ...
+cache-is-king report [--output FILE] RESULT.json
+cache-is-king env
 ```
 
-## Useful experiments
-
-### Go compiler cache
+## Install
 
 ```sh
-go run ./cmd/cache-is-king bench -- go test ./...
+go install github.com/zozo123/cache-is-king/cmd/cache-is-king@latest
 ```
 
-### Docker build plus context pollution
+The GitHub Pages installer downloads checksum-verified release archives and falls back to `go run` before the first release.
 
-```sh
-go run ./cmd/cache-is-king bench \
-  --pollute 'find . -type f -print0 | xargs -0 cat >/dev/null' \
-  -- docker buildx build --load .
-```
+## Method and limits
 
-### Large image export as the polluter
+- The isolated builder makes BuildKit state cold, but registries and host storage may already be warm.
+- The tool never calls `drop_caches`.
+- BuildKit vertices overlap; phase time is diagnostic, not an exact wall-time partition.
+- Linux metrics are strongest when the binary runs in the same cgroup/VM as the Docker workload.
+- macOS and Windows builds work, but kernel counters belong to the Linux Docker VM only when measured there.
 
-```sh
-go run ./cmd/cache-is-king bench \
-  --pollute 'docker save my-large-image:latest >/dev/null' \
-  -- go test ./...
-```
-
-### Machine-readable experiment
-
-```sh
-go run ./cmd/cache-is-king bench --json -- go test ./... > result.json
-```
-
-The JSON format is intentionally suitable for comparing:
-
-- default Linux page-cache behavior;
-- cgroup memory protection;
-- `posix_fadvise`-aware exporters;
-- persistent disks with cold guest RAM;
-- custom `cache_ext` policies;
-- runner sizes and BuildKit concurrency levels.
-
-## What it measures
-
-| Signal | Meaning |
-| --- | --- |
-| Cold-ish duration | First measured execution in the current environment |
-| Warm duration | Immediate repeated execution |
-| Warm speedup | Cold-ish duration divided by warm duration |
-| Pollution penalty | Final duration relative to the warm baseline |
-| `workingset_refault_file` | File pages that were evicted and needed again |
-| `pgmajfault` | Faults requiring storage access |
-| Memory PSI | Time tasks stalled under memory pressure |
-| I/O PSI | Time tasks stalled on storage |
-
-This is not a laboratory-grade cold-cache harness: it never calls `drop_caches`, and the first run may inherit existing machine state. That is deliberate. It evaluates the cache behavior developers and CI runners actually experience without requiring privileged access.
-
-## Product direction
-
-The next useful layers are:
-
-1. **Repository doctor** — detect Go, Rust, Bazel, BuildKit, package-manager, and CI cache configuration; suggest a precise experiment.
-2. **BuildKit trace correlation** — map refault and PSI deltas to LLB vertices such as compilation, snapshotting, export, and image loading.
-3. **Experiment matrix** — run memory, concurrency, and cache-policy sweeps and compare JSON reports.
-4. **Hot-set manifest** — identify the small high-value file set worth prefetching when a persistent disk is attached to a fresh VM.
-5. **`cache_ext` adapter** — execute the same workload under multiple page-cache policies and rank them by build time, refault tax, and tail latency.
-
-The long-term goal is an open benchmark and profiler for answering a deceptively simple question:
-
-> A cache hit occurred—but where did the bytes come from, and was the hit actually fast?
+Inspired by [The physics of Docker build caching](https://www.blacksmith.sh/blog/the-physics-of-docker-build-caching), [Cache is King](https://arxiv.org/abs/2502.02750), and [`cache_ext`](https://github.com/cache-ext/cache_ext).
 
 ## Develop
 
-Requires Go 1.24 or newer.
-
 ```sh
 go test ./...
-go run ./cmd/cache-is-king bench -- go test ./...
+go vet ./...
+go run ./cmd/cache-is-king doctor .
 ```
 
-## Relationship to Wasted Cycles
-
-[`wasted-cycles`](https://github.com/zozo123/wasted-cycles) finds machine time blocking agent work. `cache-is-king` explains one important cause: why builds remain slow even when logical caches exist.
-
-A future integration can let Wasted Cycles identify a repeated slow build and launch a Cache Is King experiment automatically.
-
-## License
-
-MIT
+MIT.
