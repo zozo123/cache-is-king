@@ -1,0 +1,25 @@
+name: CI
+on:
+  push:
+    branches: [main, agent/cache-profiler-mvp]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Format
+        run: test -z "$(gofmt -l .)"
+      - run: go vet ./...
+      - run: go test -count=1 ./...
+      - run: go build ./cmd/cache-is-king
+      - name: Dogfood cache doctor
+        run: go run ./cmd/cache-is-king doctor --strict .
+      - name: Dockerfile checks
+        run: docker buildx build --check .
