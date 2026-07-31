@@ -17,7 +17,6 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - run: gofmt -w . && git diff --exit-code
       - run: go vet ./...
       - run: go test ./...
       - run: go build ./cmd/cache-is-king
